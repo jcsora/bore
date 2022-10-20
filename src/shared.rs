@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncWrite, BufWriter, BufReader, AsyncReadExt, AsyncWriteExt};
 
 use tokio::time::timeout;
 use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
@@ -100,6 +100,11 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     }
 }
 
+
+use std::sync::Mutex;
+
+static PROXY_SEQ: Mutex<usize> = Mutex::new(0);
+
 /// Copy data mutually between two read/write streams.
 pub async fn proxy<S1, S2>(stream1: S1, stream2: S2) -> io::Result<()>
 where
@@ -108,9 +113,48 @@ where
 {
     let (mut s1_read, mut s1_write) = io::split(stream1);
     let (mut s2_read, mut s2_write) = io::split(stream2);
-    tokio::select! {
-        res = io::copy(&mut s1_read, &mut s2_write) => res,
-        res = io::copy(&mut s2_read, &mut s1_write) => res,
-    }?;
+    let mut seq = 0;
+    {
+        let mut proxy_seq = PROXY_SEQ.lock().unwrap();
+        *proxy_seq += 1;
+        println!("proxy sequence: {:?}", *proxy_seq);
+        seq = *proxy_seq;
+        println!("seq: {:?}", seq);
+    }
+    let mut s1_read_buf: [u8; 8192] = [0; 8192];
+    let mut s2_read_buf: [u8; 8192] = [0; 8192];
+
+    if seq == 2 {
+        let s1_len = tokio::select! {
+            r = s1_read.read(&mut s1_read_buf) => r,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(0),
+        }?;
+
+        let s2_len = tokio::select! {
+            r = s2_read.read(&mut s2_read_buf) => r,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(0),
+        }?;
+        println!("s1 len : {:?}", s1_len);
+        println!("s2 len: {:?}", s2_len);
+
+        if s1_len > 0 {
+            let mut s1 = &s1_read_buf[..s1_len];
+            println!("s1_read_buf: {:?}", s1);
+            io::copy(&mut s1, &mut s2_write).await?;
+        }
+        if s2_len > 0 {
+            let mut s2 = &s2_read_buf[..s2_len];
+            println!("s2_read_buf: {:?}", s2);
+            io::copy(&mut s2, &mut s1_write).await?;
+        }
+    } else if seq == 3 {
+        let body = b"{\"status\":false}";
+        io::copy(&mut &body[..], &mut s2_write).await?;
+    } else {
+        tokio::select! {
+            res = io::copy(&mut s1_read, &mut s2_write) => res,
+            res = io::copy(&mut s2_read, &mut s1_write) => res,
+        }?;
+    }
     Ok(())
 }
