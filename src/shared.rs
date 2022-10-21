@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{self, AsyncRead, AsyncWrite, BufWriter, BufReader, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
 use tokio::time::timeout;
 use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
@@ -100,10 +100,18 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     }
 }
 
+use clap::lazy_static::lazy_static;
+use std::collections::btree_map::BTreeMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tokio::sync::{Mutex, RwLock};
 
-use std::sync::Mutex;
-
-static PROXY_SEQ: Mutex<usize> = Mutex::new(0);
+lazy_static! {
+    static ref PROXY_SEQ: Mutex<usize> = Mutex::new(0);
+    static ref BUF_DATA: Arc<RwLock<BTreeMap<u128, (u8, Vec<u8>)>>> =
+        Arc::new(RwLock::new(BTreeMap::new()));
+}
 
 /// Copy data mutually between two read/write streams.
 pub async fn proxy<S1, S2>(stream1: S1, stream2: S2) -> io::Result<()>
@@ -113,48 +121,121 @@ where
 {
     let (mut s1_read, mut s1_write) = io::split(stream1);
     let (mut s2_read, mut s2_write) = io::split(stream2);
-    let mut seq = 0;
-    {
-        let mut proxy_seq = PROXY_SEQ.lock().unwrap();
-        *proxy_seq += 1;
-        println!("proxy sequence: {:?}", *proxy_seq);
-        seq = *proxy_seq;
-        println!("seq: {:?}", seq);
-    }
+
+    //tokio::select! {
+    //    res = io::copy(&mut s1_read, &mut s2_write) => res,
+    //    res = io::copy(&mut s2_read, &mut s1_write) => res,
+    //}?;
+
     let mut s1_read_buf: [u8; 8192] = [0; 8192];
     let mut s2_read_buf: [u8; 8192] = [0; 8192];
 
-    if seq == 2 {
-        let s1_len = tokio::select! {
-            r = s1_read.read(&mut s1_read_buf) => r,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(0),
-        }?;
+    {
+        let mut proxy_seq = PROXY_SEQ.lock().await;
+        *proxy_seq += 1;
+        println!("代理次数: {proxy_seq}");
+    }
 
-        let s2_len = tokio::select! {
-            r = s2_read.read(&mut s2_read_buf) => r,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(0),
-        }?;
-        println!("s1 len : {:?}", s1_len);
-        println!("s2 len: {:?}", s2_len);
+    let (s1_tx, mut s1_rx) = mpsc::channel::<Vec<u8>>(8192);
+    let (s2_tx, mut s2_rx) = mpsc::channel::<Vec<u8>>(8192);
 
-        if s1_len > 0 {
-            let mut s1 = &s1_read_buf[..s1_len];
-            println!("s1_read_buf: {:?}", s1);
-            io::copy(&mut s1, &mut s2_write).await?;
+    let mut handle = None;
+    {
+        let proxy_seq = PROXY_SEQ.lock().await;
+        let seq = *proxy_seq;
+        if seq == 2 {
+            println!("使用第一次请求的数据: 线程启动");
+            handle = Some(tokio::spawn(async move {
+                let buf_data = BUF_DATA.read().await;
+                println!("使用第一次请求的数据: 开始转发数据");
+
+                for (_, (n, data)) in buf_data.iter() {
+                    if *n == 0 {
+                        s1_tx.send(data.to_vec()).await.unwrap();
+                    } else {
+                        s2_tx.send(data.to_vec()).await.unwrap();
+                    }
+                }
+            }));
         }
-        if s2_len > 0 {
-            let mut s2 = &s2_read_buf[..s2_len];
-            println!("s2_read_buf: {:?}", s2);
-            io::copy(&mut s2, &mut s1_write).await?;
-        }
-    } else if seq == 3 {
-        let body = b"{\"status\":false}";
-        io::copy(&mut &body[..], &mut s2_write).await?;
-    } else {
+    }
+
+    for _ in 0..20 {
+        //let _ = loop {
         tokio::select! {
-            res = io::copy(&mut s1_read, &mut s2_write) => res,
-            res = io::copy(&mut s2_read, &mut s1_write) => res,
+            res = {
+                async {
+                    let len = s1_read.read(&mut s1_read_buf).await?;
+                    let mut s1 = &s1_read_buf[..len];
+
+                    let mut _buf = Vec::new();
+                    {
+                        let proxy_seq = PROXY_SEQ.lock().await;
+                        let seq = *proxy_seq;
+                        if seq == 1 && len > 0 {
+                            let time = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                                Ok(n) => n.as_nanos(),
+                                Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+                            };
+                            let mut buf_data = BUF_DATA.write().await;
+                            buf_data.insert(time, (0, s1.to_vec()));
+                            println!("远程->本地; 记录转发数据:\n{:?}", buf_data);
+                        } else if seq == 2 {
+                            while let Some(data) = s1_rx.recv().await {
+                                _buf = data;
+                                s1 = &_buf[..];
+                            }
+                            println!("远程->本地; 转发第一次请求的计算结果");
+                        } else if seq == 3 {
+                            s1 = b"{\"status\":false}";
+                            println!("远程->本地; 转发非TEE环境计算结果");
+                        }
+                    }
+
+                    io::copy(&mut s1, &mut s2_write).await.unwrap();
+                    println!("远程->本地; 转发数据成功");
+                    Ok::<(), std::io::Error>(())
+                }
+            } => res,
+            res = {
+                async {
+                    let len = s2_read.read(&mut s2_read_buf).await?;
+                    let mut s2 = &s2_read_buf[..len];
+
+                    let mut _buf = Vec::new();
+                    {
+                        let proxy_seq = PROXY_SEQ.lock().await;
+                        let seq = *proxy_seq;
+                        if seq == 1 && len > 0 {
+                            let time = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                                Ok(n) => n.as_nanos(),
+                                Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+                            };
+                            let mut buf_data = BUF_DATA.write().await;
+                            buf_data.insert(time, (1, s2.to_vec()));
+                            println!("本地->远程; 记录转发数据:\n{:?}", buf_data);
+                        } else if seq == 2 {
+                            while let Some(data) = s2_rx.recv().await {
+                                _buf = data;
+                                s2 = &_buf[..];
+                            }
+                            println!("本地->远程; 转发第一次请求的计算结果");
+                        } else if seq == 3 {
+                            s2 = b"{\"status\":false}";
+                            println!("本地->远程; 转发非TEE环境计算结果");
+                        }
+                    }
+
+                    io::copy(&mut s2, &mut s1_write).await.unwrap();
+                    println!("远程->本地; 转发数据成功");
+                    Ok::<(), std::io::Error>(())
+                }
+            }=> res,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(()),
         }?;
+    }
+    if let Some(handle) = handle {
+        handle.await?;
     }
     Ok(())
 }
