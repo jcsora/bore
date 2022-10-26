@@ -43,6 +43,12 @@ enum Command {
         /// Optional secret for authentication.
         #[clap(short, long, env = "BORE_SECRET", hide_env_values = true)]
         secret: Option<String>,
+
+        #[clap(long, default_value_t = 15)]
+        count: u32,
+
+        #[clap(long, default_value_t = 1)]
+        timeout: u32,
     },
 }
 
@@ -59,8 +65,8 @@ async fn run(command: Command) -> Result<()> {
             let client = Client::new(&local_host, local_port, &to, port, secret.as_deref()).await?;
             client.listen().await?;
         }
-        Command::Server { min_port, secret } => {
-            Server::new(min_port, secret.as_deref()).listen().await?;
+        Command::Server { min_port, secret, count, timeout} => {
+            Server::new(min_port, secret.as_deref(), count, timeout).listen().await?;
         }
     }
 

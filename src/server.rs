@@ -25,15 +25,21 @@ pub struct Server {
 
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
+
+    count: u32,
+
+    timeout: u32,
 }
 
 impl Server {
     /// Create a new server with a specified minimum port number.
-    pub fn new(min_port: u16, secret: Option<&str>) -> Self {
+    pub fn new(min_port: u16, secret: Option<&str>, count: u32, timeout: u32) -> Self {
         Server {
             min_port,
             conns: Arc::new(DashMap::new()),
             auth: secret.map(Authenticator::new),
+            count,
+            timeout,
         }
     }
 
@@ -127,7 +133,7 @@ impl Server {
                         let parts = stream.into_parts();
                         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
                         stream2.write_all(&parts.read_buf).await?;
-                        proxy(parts.io, stream2).await?
+                        proxy(parts.io, stream2, self.count, self.timeout).await?
                     }
                     None => warn!(%id, "missing connection"),
                 }
@@ -143,6 +149,6 @@ impl Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Server::new(1024, None)
+        Server::new(1024, None, 15, 1)
     }
 }

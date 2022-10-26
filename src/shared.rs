@@ -114,7 +114,7 @@ lazy_static! {
 }
 
 /// Copy data mutually between two read/write streams.
-pub async fn proxy<S1, S2>(stream1: S1, stream2: S2) -> io::Result<()>
+pub async fn proxy<S1, S2>(stream1: S1, stream2: S2, count: u32, timeout: u32) -> io::Result<()>
 where
     S1: AsyncRead + AsyncWrite + Unpin,
     S2: AsyncRead + AsyncWrite + Unpin,
@@ -160,7 +160,7 @@ where
         }
     }
 
-    for _ in 0..20 {
+    for _ in 0..count {
         //let _ = loop {
         tokio::select! {
             res = {
@@ -231,11 +231,28 @@ where
                     Ok::<(), std::io::Error>(())
                 }
             }=> res,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(timeout as u64)) => Ok(()),
         }?;
     }
     if let Some(handle) = handle {
         handle.await?;
     }
+    Ok(())
+}
+
+/// Copy data mutually between two read/write streams.
+pub async fn proxy_client<S1, S2>(stream1: S1, stream2: S2) -> io::Result<()>
+where
+    S1: AsyncRead + AsyncWrite + Unpin,
+    S2: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut s1_read, mut s1_write) = io::split(stream1);
+    let (mut s2_read, mut s2_write) = io::split(stream2);
+
+    tokio::select! {
+        res = io::copy(&mut s1_read, &mut s2_write) => res,
+        res = io::copy(&mut s2_read, &mut s1_write) => res,
+    }?;
+
     Ok(())
 }

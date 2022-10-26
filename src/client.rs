@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::Authenticator;
 use crate::shared::{
-    proxy, ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT,
+    proxy_client, ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT,
 };
 
 /// State structure for the client.
@@ -117,7 +117,7 @@ impl Client {
         let parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
         local_conn.write_all(&parts.read_buf).await?; // mostly of the cases, this will be empty
-        proxy(local_conn, parts.io).await?;
+        proxy_client(local_conn, parts.io, ).await?;
         Ok(())
     }
 }
